@@ -6,12 +6,20 @@
 
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
+import { find, findByCodeLazy } from "@webpack";
+import { ApplicationStreamingStore, ChannelStore, FluxDispatcher, GuildChannelStore, RestAPI, RunningGameStore } from "@webpack/common";
 
 const settings = definePluginSettings({
     autoAcceptQuests: {
         type: OptionType.BOOLEAN,
         description: "Automatically accept all available quests",
         default: false,
+        restartNeeded: false
+    },
+    fetchIntervalMinutes: {
+        type: OptionType.NUMBER,
+        description: "How often to ask Discord for new quests, in minutes (minimum 30)",
+        default: 120,
         restartNeeded: false
     },
     logProgress: {
@@ -24,21 +32,30 @@ const settings = definePluginSettings({
 
 const SUPPORTED_TASKS = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"];
 
-let ApplicationStreamingStore: any;
-let RunningGameStore: any;
-let QuestsStore: any;
-let ChannelStore: any;
-let GuildChannelStore: any;
-let FluxDispatcher: any;
-let api: any;
+const MIN_FETCH_MINUTES = 30;
+const SCAN_INTERVAL_MS = 60_000;
+
+const fetchQuests = findByCodeLazy("QUESTS_FETCH_CURRENT_QUESTS_BEGIN") as () => Promise<unknown>;
+
+// displayName doesn't survive minification, so match on shape instead
+let questsStore: any = null;
+function getQuestsStore() {
+    questsStore ??= find((m: any) => m?.quests instanceof Map && typeof m.getQuest === "function", { isIndirect: true });
+    return questsStore;
+}
+
 let isApp: boolean;
 
-let initialized = false;
 let processingQuests = false;
 let questQueue: any[] = [];
+let activeQuestId: string | null = null;
+let activeCleanup: (() => void) | null = null;
 let pollInterval: ReturnType<typeof setInterval> | null = null;
+let fetchInterval: ReturnType<typeof setInterval> | null = null;
 let fluxUnsubs: (() => void)[] = [];
-let sessionStarting = false;
+
+// async loops capture this and bail once it moves, otherwise they keep hitting the API after stop()
+let generation = 0;
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
@@ -67,49 +84,9 @@ function isCompleted(quest: any): boolean {
     return !!quest.userStatus?.completedAt;
 }
 
-function initStores(): boolean {
-    if (initialized) return true;
-
-    try {
-        const wpRequire = (window as any).webpackChunkdiscord_app.push([[Symbol()], {}, (r: any) => r]);
-        (window as any).webpackChunkdiscord_app.pop();
-
-        ApplicationStreamingStore = Object.values(wpRequire.c).find((x: any) =>
-            x?.exports?.Z?.__proto__?.getStreamerActiveStreamMetadata
-        )?.exports?.Z;
-
-        if (!ApplicationStreamingStore) {
-            ApplicationStreamingStore = Object.values(wpRequire.c).find((x: any) =>
-                x?.exports?.A?.__proto__?.getStreamerActiveStreamMetadata
-            )?.exports?.A;
-            RunningGameStore  = Object.values(wpRequire.c).find((x: any) => x?.exports?.Ay?.getRunningGames)?.exports?.Ay;
-            QuestsStore       = Object.values(wpRequire.c).find((x: any) => x?.exports?.A?.__proto__?.getQuest)?.exports?.A;
-            ChannelStore      = Object.values(wpRequire.c).find((x: any) => x?.exports?.A?.__proto__?.getAllThreadsForParent)?.exports?.A;
-            GuildChannelStore = Object.values(wpRequire.c).find((x: any) => x?.exports?.Ay?.getSFWDefaultChannel)?.exports?.Ay;
-            FluxDispatcher    = Object.values(wpRequire.c).find((x: any) => x?.exports?.h?.__proto__?.flushWaitQueue)?.exports?.h;
-            api               = Object.values(wpRequire.c).find((x: any) => x?.exports?.Bo?.get)?.exports?.Bo;
-        } else {
-            RunningGameStore  = Object.values(wpRequire.c).find((x: any) => x?.exports?.ZP?.getRunningGames)?.exports?.ZP;
-            QuestsStore       = Object.values(wpRequire.c).find((x: any) => x?.exports?.Z?.__proto__?.getQuest)?.exports?.Z;
-            ChannelStore      = Object.values(wpRequire.c).find((x: any) => x?.exports?.Z?.__proto__?.getAllThreadsForParent)?.exports?.Z;
-            GuildChannelStore = Object.values(wpRequire.c).find((x: any) => x?.exports?.ZP?.getSFWDefaultChannel)?.exports?.ZP;
-            FluxDispatcher    = Object.values(wpRequire.c).find((x: any) => x?.exports?.Z?.__proto__?.flushWaitQueue)?.exports?.Z;
-            api               = Object.values(wpRequire.c).find((x: any) => x?.exports?.tn?.get)?.exports?.tn;
-        }
-
-        if (!QuestsStore || !FluxDispatcher || !api) {
-            console.error("[QuestAutocompleter] Failed to find required stores");
-            return false;
-        }
-
-        isApp = typeof (window as any).DiscordNative !== "undefined";
-        initialized = true;
-        log("Stores initialized, isApp =", isApp);
-        return true;
-    } catch (e) {
-        console.error("[QuestAutocompleter] Init failed:", e);
-        return false;
-    }
+// queued entries go stale while a long quest runs, so re-read before use
+function refreshQuest(quest: any) {
+    return getQuestsStore()?.quests?.get(quest.id) ?? quest;
 }
 
 async function enrollQuest(quest: any): Promise<boolean> {
@@ -118,7 +95,7 @@ async function enrollQuest(quest: any): Promise<boolean> {
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
-            const res = await api.post({
+            const res = await RestAPI.post({
                 url: `/quests/${quest.id}/enroll`,
                 body: {
                     location: 11,
@@ -161,9 +138,10 @@ async function enrollQuest(quest: any): Promise<boolean> {
 
 async function autoAcceptAvailableQuests(): Promise<boolean> {
     if (!settings.store.autoAcceptQuests) return false;
-    if (!QuestsStore?.quests) return false;
+    const store = getQuestsStore();
+    if (!store?.quests) return false;
 
-    const unaccepted = [...QuestsStore.quests.values()].filter(q =>
+    const unaccepted = [...store.quests.values()].filter((q: any) =>
         !isEnrolled(q) && !isCompleted(q) && isCompletable(q)
     );
 
@@ -182,14 +160,16 @@ async function autoAcceptAvailableQuests(): Promise<boolean> {
 }
 
 function syncQueueFromStore() {
-    if (!QuestsStore?.quests) return;
+    const store = getQuestsStore();
+    if (!store?.quests) return;
 
-    const enrolled = [...QuestsStore.quests.values()].filter(q =>
+    const enrolled = [...store.quests.values()].filter((q: any) =>
         isEnrolled(q) && !isCompleted(q) && isCompletable(q)
     );
 
     let added = 0;
     for (const quest of enrolled) {
+        if (quest.id === activeQuestId) continue;
         if (!questQueue.find(q => q.id === quest.id)) {
             questQueue.push(quest);
             added++;
@@ -206,59 +186,94 @@ function syncQueueFromStore() {
 }
 
 async function scan() {
-    if (!initialized) return;
     const newlyEnrolled = await autoAcceptAvailableQuests();
     if (newlyEnrolled) await sleep(1500);
     syncQueueFromStore();
 }
 
-function startSession() {
-    if (sessionStarting) return;
-    sessionStarting = true;
+async function fetchNewQuests() {
+    try {
+        log("Checking for new quests...");
+        await fetchQuests();
+        await sleep(1000);
+    } catch (e) {
+        log("Quest fetch failed (will retry next cycle):", e);
+        return;
+    }
+    await scan();
+}
 
-    initialized      = false;
+function shutdown() {
+    generation++;
+
+    activeCleanup?.();
+    activeCleanup = null;
+    activeQuestId = null;
     processingQuests = false;
-    questQueue       = [];
+    questQueue = [];
 
     if (pollInterval !== null) {
         clearInterval(pollInterval);
         pollInterval = null;
     }
+    if (fetchInterval !== null) {
+        clearInterval(fetchInterval);
+        fetchInterval = null;
+    }
+}
 
-    setTimeout(async () => {
-        sessionStarting = false;
-        if (!initStores()) return;
+function startSession() {
+    shutdown();
 
-        try {
-            log("Fetching quests from API...");
-            await api.get({ url: "/quests/@me" });
-            log("Quest data loaded");
-        } catch (e) {
-            log("Could not pre-fetch quests (will retry on next poll):", e);
-        }
+    isApp = typeof (window as any).DiscordNative !== "undefined";
 
-        pollInterval = setInterval(() => scan(), 60_000);
-        scan();
-    }, 2000);
+    const minutes = Math.max(MIN_FETCH_MINUTES, settings.store.fetchIntervalMinutes ?? 120);
+    pollInterval = setInterval(() => scan(), SCAN_INTERVAL_MS);
+    fetchInterval = setInterval(() => fetchNewQuests(), minutes * 60_000);
+    log(`Session started (isApp = ${isApp}, checking for new quests every ${minutes} min)`);
+
+    fetchNewQuests();
 }
 
 function doJob() {
-    const quest = questQueue.shift();
-    if (!quest) {
+    activeCleanup?.();
+    activeCleanup = null;
+    activeQuestId = null;
+
+    const queued = questQueue.shift();
+    if (!queued) {
         processingQuests = false;
         log("All queued quests done.");
         return;
     }
 
-    processingQuests = true;
+    const quest = refreshQuest(queued);
+    if (isCompleted(quest)) {
+        doJob();
+        return;
+    }
 
+    processingQuests = true;
+    activeQuestId = quest.id;
+
+    try {
+        startQuest(quest);
+    } catch (e) {
+        log(`Failed to start "${quest.config.messages?.questName}":`, e);
+        doJob();
+    }
+}
+
+function startQuest(quest: any) {
+    const myGen           = generation;
     const pid             = Math.floor(Math.random() * 30000) + 1000;
-    const applicationId   = quest.config.application.id;
-    const applicationName = quest.config.application.name;
     const questName       = quest.config.messages.questName;
     const taskConfig      = getTaskConfig(quest);
     const taskName        = SUPPORTED_TASKS.find(x => taskConfig.tasks[x] != null)!;
-    const secondsNeeded   = taskConfig.tasks[taskName].target;
+    const taskData        = taskConfig.tasks[taskName];
+    const applicationId   = quest.config.application?.id ?? taskData.applications?.[0]?.id;
+    const applicationName = quest.config.application?.name ?? taskData.applications?.[0]?.name ?? questName;
+    const secondsNeeded   = taskData.target;
     let secondsDone       = quest.userStatus?.progress?.[taskName]?.value ?? 0;
 
     if (taskName === "WATCH_VIDEO" || taskName === "WATCH_VIDEO_ON_MOBILE") {
@@ -268,17 +283,17 @@ function doJob() {
 
         (async () => {
             try {
-                while (true) {
+                while (myGen === generation) {
                     const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
                     const diff = maxAllowed - secondsDone;
                     const timestamp = secondsDone + speed;
 
                     if (diff >= speed) {
-                        const res = await api.post({
+                        const res = await RestAPI.post({
                             url: `/quests/${quest.id}/video-progress`,
                             body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) }
                         });
-                        completed = res.body.completed_at != null;
+                        completed = res.body?.completed_at != null;
                         secondsDone = Math.min(secondsNeeded, timestamp);
                     }
 
@@ -286,8 +301,10 @@ function doJob() {
                     await sleep(interval * 1000);
                 }
 
+                if (myGen !== generation) return;
+
                 if (!completed) {
-                    await api.post({
+                    await RestAPI.post({
                         url: `/quests/${quest.id}/video-progress`,
                         body: { timestamp: secondsNeeded }
                     });
@@ -297,7 +314,7 @@ function doJob() {
             } catch (e) {
                 log(`Error completing "${questName}":`, e);
             }
-            doJob();
+            if (myGen === generation) doJob();
         })();
 
         log(`Spoofing video: ${questName}`);
@@ -309,8 +326,10 @@ function doJob() {
             return;
         }
 
-        api.get({ url: `/applications/public?application_ids=${applicationId}` })
+        RestAPI.get({ url: `/applications/public?application_ids=${applicationId}` })
             .then((res: any) => {
+                if (myGen !== generation) return;
+
                 const appData = res.body?.[0];
 
                 if (!appData) {
@@ -323,7 +342,7 @@ function doJob() {
                 const anyExe   = appData.executables?.[0];
                 const exeName  = (win32Exe ?? anyExe)?.name?.replace(">", "") ?? `${appData.name}.exe`;
 
-                const fakeGame = {
+                const fakeGame: any = {
                     cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
                     exeName,
                     exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
@@ -341,7 +360,10 @@ function doJob() {
                 const realGetRunningGames = RunningGameStore.getRunningGames;
                 const realGetGameForPID   = RunningGameStore.getGameForPID;
 
+                let done = false;
                 const cleanup = () => {
+                    if (done) return;
+                    done = true;
                     RunningGameStore.getRunningGames = realGetRunningGames;
                     RunningGameStore.getGameForPID   = realGetGameForPID;
                     FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games: [] });
@@ -349,10 +371,12 @@ function doJob() {
                 };
 
                 RunningGameStore.getRunningGames = () => [fakeGame];
-                RunningGameStore.getGameForPID   = (p: number) => (p === fakeGame.pid ? fakeGame : undefined);
+                RunningGameStore.getGameForPID   = (p: number) => (p === fakeGame.pid ? fakeGame : null);
                 FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: realGames, added: [fakeGame], games: [fakeGame] });
 
                 const fn = (data: any) => {
+                    if (data.questId !== quest.id) return;
+
                     try {
                         const progress = quest.config.configVersion === 1
                             ? data.userStatus.streamProgressSeconds
@@ -362,20 +386,20 @@ function doJob() {
 
                         if (progress >= secondsNeeded) {
                             log(`Completed: ${questName}`);
-                            cleanup();
                             doJob();
                         }
                     } catch (e) {
                         log(`Error in heartbeat handler for "${questName}":`, e);
-                        cleanup();
                         doJob();
                     }
                 };
 
                 FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                activeCleanup = cleanup;
                 log(`Spoofed game: ${applicationName} – ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min left`);
             })
             .catch((e: any) => {
+                if (myGen !== generation) return;
                 log(`Failed to fetch app data for "${questName}":`, e);
                 doJob();
             });
@@ -389,7 +413,10 @@ function doJob() {
 
         const realFunc = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
 
+        let done = false;
         const cleanup = () => {
+            if (done) return;
+            done = true;
             ApplicationStreamingStore.getStreamerActiveStreamMetadata = realFunc;
             FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
         };
@@ -401,6 +428,8 @@ function doJob() {
         });
 
         const fn = (data: any) => {
+            if (data.questId !== quest.id) return;
+
             try {
                 const progress = quest.config.configVersion === 1
                     ? data.userStatus.streamProgressSeconds
@@ -410,17 +439,16 @@ function doJob() {
 
                 if (progress >= secondsNeeded) {
                     log(`Completed: ${questName}`);
-                    cleanup();
                     doJob();
                 }
             } catch (e) {
                 log(`Error in heartbeat handler for "${questName}":`, e);
-                cleanup();
                 doJob();
             }
         };
 
         FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+        activeCleanup = cleanup;
         log(`Spoofed stream: ${applicationName} – ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min left (need 1+ in VC)`);
 
     } else if (taskName === "PLAY_ACTIVITY") {
@@ -440,8 +468,8 @@ function doJob() {
         (async () => {
             try {
                 log(`Activity: ${questName}`);
-                while (true) {
-                    const res = await api.post({
+                while (myGen === generation) {
+                    const res = await RestAPI.post({
                         url: `/quests/${quest.id}/heartbeat`,
                         body: { stream_key: streamKey, terminal: false }
                     });
@@ -449,7 +477,7 @@ function doJob() {
                     log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
 
                     if (progress >= secondsNeeded) {
-                        await api.post({
+                        await RestAPI.post({
                             url: `/quests/${quest.id}/heartbeat`,
                             body: { stream_key: streamKey, terminal: true }
                         });
@@ -458,11 +486,12 @@ function doJob() {
 
                     await sleep(20000);
                 }
+                if (myGen !== generation) return;
                 log(`Completed: ${questName}`);
             } catch (e) {
                 log(`Error completing "${questName}":`, e);
             }
-            doJob();
+            if (myGen === generation) doJob();
         })();
     }
 }
@@ -476,39 +505,21 @@ export default definePlugin({
     start() {
         log("Starting...");
 
-        const bootstrapFlux = (): any => {
-            try {
-                const wpRequire = (window as any).webpackChunkdiscord_app.push([[Symbol()], {}, (r: any) => r]);
-                (window as any).webpackChunkdiscord_app.pop();
-                return (
-                    Object.values(wpRequire.c).find((x: any) => x?.exports?.Z?.__proto__?.flushWaitQueue)?.exports?.Z ??
-                    Object.values(wpRequire.c).find((x: any) => x?.exports?.h?.__proto__?.flushWaitQueue)?.exports?.h
-                );
-            } catch { return null; }
-        };
-
-        const earlyFlux = bootstrapFlux();
-        if (!earlyFlux) {
-            console.error("[QuestAutocompleter] Could not bootstrap FluxDispatcher");
-            return;
-        }
-
         const onConnectionOpen = () => {
             log("CONNECTION_OPEN – starting new session...");
             startSession();
         };
 
         const onStatusUpdate = () => {
-            log("QUEST_USER_STATUS_UPDATE – syncing queue...");
             setTimeout(() => syncQueueFromStore(), 500);
         };
 
-        earlyFlux.subscribe("CONNECTION_OPEN", onConnectionOpen);
-        earlyFlux.subscribe("QUEST_USER_STATUS_UPDATE", onStatusUpdate);
+        FluxDispatcher.subscribe("CONNECTION_OPEN", onConnectionOpen);
+        FluxDispatcher.subscribe("QUEST_USER_STATUS_UPDATE", onStatusUpdate);
 
         fluxUnsubs = [
-            () => earlyFlux.unsubscribe("CONNECTION_OPEN", onConnectionOpen),
-            () => earlyFlux.unsubscribe("QUEST_USER_STATUS_UPDATE", onStatusUpdate),
+            () => FluxDispatcher.unsubscribe("CONNECTION_OPEN", onConnectionOpen),
+            () => FluxDispatcher.unsubscribe("QUEST_USER_STATUS_UPDATE", onStatusUpdate),
         ];
 
         startSession();
@@ -520,14 +531,6 @@ export default definePlugin({
         for (const unsub of fluxUnsubs) unsub();
         fluxUnsubs = [];
 
-        if (pollInterval !== null) {
-            clearInterval(pollInterval);
-            pollInterval = null;
-        }
-
-        questQueue       = [];
-        processingQuests = false;
-        initialized      = false;
-        sessionStarting  = false;
+        shutdown();
     }
 });
