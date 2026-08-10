@@ -4,7 +4,11 @@ Vencord plugin that auto-completes Discord quests. Accepts quests, queues them, 
 
 Handles reloads, account switches, and mid-session enabling without breaking.
 
-**This automates quest progress. Use at your own risk -- not responsible for any account actions from Discord.**
+## ⚠️ Disclaimer
+
+This plugin automates Discord quest progress. Use it at your own risk and make sure you understand Discord’s Terms of Service.
+
+I am not responsible for any account actions, flags, or bans that may occur from using this plugin.
 
 ## Supported tasks
 
