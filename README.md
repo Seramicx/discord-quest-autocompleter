@@ -22,6 +22,8 @@ Drop `questAutocompleter/` into `src/plugins/`, rebuild Vencord (`pnpm build`), 
 
 Auto-accept is off by default, toggle it in plugin settings if you want quests enrolled automatically.
 
+The plugin asks Discord for new quests every 2 hours. Change that in settings, minimum is 30 minutes.
+
 Vencord must be built from source: https://docs.vencord.dev/installing/
 
 ## Credit
