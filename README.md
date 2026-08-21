@@ -20,9 +20,11 @@ I am not responsible for any account actions, flags, or bans that may occur from
 
 Desktop app tasks get skipped on web.
 
-## Setup
+## Setup/Install
 
-Drop `questAutocompleter/` into `src/plugins/`, rebuild Vencord (`pnpm build`), enable in settings.
+Download `questAutocompleter.zip` from the latest release. Unzip, and make sure there is only 1 folder housing the .tsx file inside it. 
+
+Paste the folder into `Vencord/src/plugins/`, rebuild Vencord (`pnpm build`), enable in settings.
 
 Auto-accept is off by default, toggle it in plugin settings if you want quests enrolled automatically.
 
