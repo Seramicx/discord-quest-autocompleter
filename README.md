@@ -23,7 +23,7 @@ Desktop app tasks get skipped on web.
 
 ## Setup/Install
 
-Download `questAutocompleter.zip` from the latest release. Unzip, and make sure there is only 1 folder housing the .tsx file inside it. 
+Download `questAutocompleter.zip` from the latest release. Unzip, and make sure there is only 1 folder housing the 2 files inside it. 
 
 Paste the folder into `Vencord/src/plugins/`, mimicking the same file structure as other plugins. Rebuild Vencord (`pnpm build`), enable in settings.
 
