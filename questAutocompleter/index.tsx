@@ -5,9 +5,12 @@
  */
 
 import { definePluginSettings } from "@api/Settings";
+import { PluginNative } from "@utils/types";
 import definePlugin, { OptionType } from "@utils/types";
 import { find, findByCodeLazy } from "@webpack";
-import { ApplicationStreamingStore, ChannelStore, FluxDispatcher, GuildChannelStore, RestAPI, RunningGameStore } from "@webpack/common";
+import { ApplicationStreamingStore, AuthenticationStore, ChannelStore, FluxDispatcher, GuildChannelStore, RestAPI, RunningGameStore } from "@webpack/common";
+
+const Native = VencordNative.pluginHelpers.QuestAutocompleter as PluginNative<typeof import("./native")>;
 
 const settings = definePluginSettings({
     autoAcceptQuests: {
@@ -27,10 +30,39 @@ const settings = definePluginSettings({
         description: "Log quest completion progress to console",
         default: true,
         restartNeeded: false
+    },
+    achievementBypass: {
+        type: OptionType.BOOLEAN,
+        description: "Automatically complete achievement quests (the ones where you earn badges in an activity)",
+        default: true,
+        restartNeeded: false
+    },
+    autoClaim: {
+        type: OptionType.BOOLEAN,
+        description: "Automatically claim rewards after a quest completes. Requires a captcha solver key below",
+        default: false,
+        restartNeeded: false
+    },
+    captchaService: {
+        type: OptionType.SELECT,
+        description: "Captcha solver service used for claiming",
+        options: [
+            { label: "NopeCHA", value: "nopecha", default: true },
+            { label: "CapSolver", value: "capsolver" },
+            { label: "2Captcha", value: "twocaptcha" }
+        ],
+        disabled: () => !settings.store.autoClaim,
+        restartNeeded: false
+    },
+    captchaApiKey: {
+        type: OptionType.STRING,
+        description: "API key for the captcha solver service",
+        disabled: () => !settings.store.autoClaim,
+        restartNeeded: false
     }
 });
 
-const SUPPORTED_TASKS = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"];
+const SUPPORTED_TASKS = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE", "ACHIEVEMENT_IN_ACTIVITY"];
 
 const MIN_FETCH_MINUTES = 30;
 const SCAN_INTERVAL_MS = 60_000;
@@ -189,6 +221,79 @@ async function scan() {
     const newlyEnrolled = await autoAcceptAvailableQuests();
     if (newlyEnrolled) await sleep(1500);
     syncQueueFromStore();
+    claimCompletedQuests();
+}
+
+// quests that failed a claim this session; never retry, keeps us off Discord's radar
+const claimFailed = new Set<string>();
+let claiming = false;
+
+async function claimCompletedQuests() {
+    if (!settings.store.autoClaim) return;
+    if (!settings.store.captchaApiKey) return;
+    if (claiming) return;
+    const store = getQuestsStore();
+    if (!store?.quests) return;
+
+    const unclaimed = [...store.quests.values()].filter((q: any) =>
+        isCompleted(q)
+        && !q.userStatus?.claimedAt
+        && !claimFailed.has(q.id)
+        && getTaskConfig(q)?.tasks != null
+    );
+    if (unclaimed.length === 0) return;
+
+    claiming = true;
+    // stop() bumps generation mid-loop, so snapshot now and bail if it moves
+    const myGen = generation;
+    try {
+        for (const quest of unclaimed) {
+            if (myGen !== generation) break;
+            try {
+                await claimReward(quest);
+            } catch (e: any) {
+                log(`Failed to claim "${quest.config.messages.questName}":`, e?.message ?? e);
+                // one shot per quest per session
+                claimFailed.add(quest.id);
+            }
+            await sleep(Math.floor(Math.random() * 5000) + 8000);
+        }
+    } finally {
+        claiming = false;
+    }
+}
+
+async function claimReward(quest: any) {
+    const questName = quest.config.messages.questName;
+
+    // user token straight off the auth store; Discord's RestAPI would intercept the
+    // 403 challenge and pop its own captcha modal, so the claim goes via main instead
+    const attemptClaim = (captchaToken?: string) => Native.claimReward({
+        userToken: (AuthenticationStore as any).getToken(),
+        questId: quest.id,
+        captchaToken,
+        trafficMetadataSealed: quest.userStatus?.trafficMetadataSealed ?? null
+    });
+
+    log(`Claiming reward for "${questName}"...`);
+    let res = await attemptClaim();
+
+    if (!res.ok && res.body?.captcha_sitekey) {
+        log(`Solving hCaptcha for "${questName}"...`);
+        const solved = await Native.solveCaptcha({
+            service: settings.store.captchaService,
+            apiKey: settings.store.captchaApiKey,
+            websiteUrl: "https://discord.com/",
+            siteKey: res.body.captcha_sitekey
+        });
+        res = await attemptClaim(solved.token);
+    }
+
+    if (res.body?.claimed_at == null) {
+        throw new Error(res.ok ? "no claimed_at in response" : `status ${res.status}: ${res.body?.message ?? JSON.stringify(res.body)?.slice(0, 120)}`);
+    }
+
+    log(`Claimed reward: ${questName}`);
 }
 
 async function fetchNewQuests() {
@@ -261,6 +366,89 @@ function doJob() {
     } catch (e) {
         log(`Failed to start "${quest.config.messages?.questName}":`, e);
         doJob();
+    }
+}
+
+// achievement quests ignore plain heartbeat spoofing until discord thinks the activity itself authorized us,
+// which is what this oauth roundtrip fakes; grants created along the way get revoked at the end
+async function bypassAchievement(quest: any, applicationId: string, myGen: number): Promise<boolean> {
+    const questName = quest.config.messages.questName;
+    const target = getTaskConfig(quest)?.tasks?.ACHIEVEMENT_IN_ACTIVITY?.target ?? 0;
+    if (target <= 0) throw new Error("no ACHIEVEMENT_IN_ACTIVITY target on this quest");
+
+    const beforeIds = new Set<string>();
+    try {
+        const res = await RestAPI.get({ url: "/oauth2/tokens" });
+        for (const g of res.body ?? []) beforeIds.add(g.id);
+    } catch { }
+
+    try {
+        const authRes = await RestAPI.post({
+            url: "/oauth2/authorize",
+            query: {
+                response_type: "code",
+                client_id: applicationId,
+                scope: "identify applications.commands applications.entitlements"
+            },
+            body: {
+                permissions: "0",
+                authorize: true,
+                integration_type: 1,
+                location_context: {
+                    guild_id: "10000",
+                    channel_id: "10000",
+                    channel_type: 10000
+                }
+            }
+        });
+
+        const location = authRes.body?.location;
+        const code = location ? new URL(location).searchParams.get("code") : null;
+        if (!code) throw new Error(`no code in authorize response (${JSON.stringify(authRes.body)?.slice(0, 120)})`);
+
+        const ticketRes = await RestAPI.post({
+            url: `/applications/${applicationId}/proxy-tickets`,
+            body: {}
+        });
+        const ticket = ticketRes.body?.ticket;
+        if (!ticket) throw new Error("no proxy ticket");
+
+        const referrer = `https://${applicationId}.discordsays.com/?instance_id=example-cl-instance&platform=desktop&discord_proxy_ticket=${ticket}`;
+        const acfAuth = await Native.discordsaysAuthorize({ appId: applicationId, questId: quest.id, referrer, code });
+        if (!acfAuth.ok || !acfAuth.body?.token) throw new Error(`acf authorize failed (status ${acfAuth.status})`);
+
+        // walk progress up over real time instead of jumping to target, so completion takes as long as playing would
+        let done = 0;
+        log(`Bypassing achievement: ${questName} – ~${Math.ceil(target / 60)} min left`);
+        while (done < target && myGen === generation) {
+            done = Math.min(target, done + Math.floor(Math.random() * 20) + 30);
+            const progressRes = await Native.discordsaysProgress({
+                appId: applicationId,
+                questId: quest.id,
+                referrer,
+                token: acfAuth.body.token,
+                progress: done
+            });
+            if (!progressRes.ok) throw new Error(`acf progress failed (status ${progressRes.status}): ${JSON.stringify(progressRes.body)?.slice(0, 120)}`);
+            log(`[${questName}] Progress: ${done}/${target} – ~${Math.ceil((target - done) / 60)} min left`);
+            if (done < target) await sleep(Math.floor(Math.random() * 4000) + 18000);
+        }
+
+        if (myGen !== generation) return false;
+
+        log(`Completed via bypass: ${questName}`);
+        return true;
+    } catch (e: any) {
+        log(`Bypass failed for "${questName}":`, e?.message ?? e);
+        return false;
+    } finally {
+        // revoke whatever grants this run created
+        try {
+            const after = await RestAPI.get({ url: "/oauth2/tokens" });
+            for (const g of after.body ?? []) {
+                if (!beforeIds.has(g.id)) RestAPI.del({ url: `/oauth2/tokens/${g.id}` }).catch(() => { });
+            }
+        } catch { }
     }
 }
 
@@ -484,12 +672,26 @@ function startQuest(quest: any) {
                         break;
                     }
 
-                    await sleep(20000);
+                        await sleep(20000);
                 }
                 if (myGen !== generation) return;
                 log(`Completed: ${questName}`);
             } catch (e) {
                 log(`Error completing "${questName}":`, e);
+            }
+            if (myGen === generation) doJob();
+        })();
+    } else if (taskName === "ACHIEVEMENT_IN_ACTIVITY") {
+        // heartbeats are always rejected here without a real activity session, so straight to the oauth bypass
+        (async () => {
+            if (settings.store.achievementBypass) {
+                try {
+                    await bypassAchievement(quest, applicationId, myGen);
+                } catch (e) {
+                    log(`Error bypassing "${questName}":`, e);
+                }
+            } else {
+                log(`Skipped "${questName}" – achievement bypass is disabled in settings`);
             }
             if (myGen === generation) doJob();
         })();
