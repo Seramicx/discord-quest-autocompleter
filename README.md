@@ -1,10 +1,10 @@
 ﻿# QuestAutocompleter
 
-Vencord plugin that auto-completes Discord quests. Accepts quests, queues them, and spoofs game/stream/video progress until they're done.
+Vencord plugin that auto-completes Discord quests. Can auto-accept quests, queue them, spoof game/stream/video progress until they're done, and auto-claim if given a captcha solver API key.
 
 Handles reloads, account switches, and mid-session enabling without breaking.
 
-## Disclaimer
+## ⚠️ Disclaimer
 
 This plugin automates Discord quest progress. Use it at your own risk and make sure you understand Discord's Terms of Service.
 
@@ -35,7 +35,7 @@ Vencord must be built from source: https://docs.vencord.dev/installing/
 
 ## Achievement quests
 
-Achievement quests (earn badges inside an activity) are handled automatically via OAuth. The plugin authorizes itself with the activity, then fires off the badge completion request. On by default, can be toggled with "Achievement Bypass" in settings.
+Achievement quests (earn badges inside an activity) are handled automatically via OAuth. The plugin authorizes itself with the activity, then fires off the badge completion request after a realistic-seeming amount of time. On by default, can be toggled with "Achievement Bypass" in settings.
 
 ## Auto-claim
 
