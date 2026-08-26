@@ -27,7 +27,7 @@ Download `questAutocompleter.zip` from the latest release. Unzip, and make sure 
 
 Paste the folder into `Vencord/src/plugins/`, mimicking the same file structure as other plugins. Rebuild Vencord (`pnpm build`), enable in settings.
 
-Auto-accept is off by default, toggle it in plugin settings if you want quests enrolled automatically.
+Auto-accept & auto-claim are off by default, toggle them in plugin settings if you want quests enrolled and/or claimed automatically. Auto-claim requires more setup as it needs an external captcha solver API key.
 
 The plugin asks Discord for new quests every 2 hours. Change that in settings, minimum is 30 minutes.
 
